@@ -1,0 +1,161 @@
+name: Deploy Azure VM
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target deployment environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  AZURE_RESOURCE_GROUP: rg-actions-demo
+  VM_NAME: vm-actions-demo
+  LOCATION: eastus
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1 – Validate the Bicep template
+  # ─────────────────────────────────────────────
+  validate:
+    name: Validate Infrastructure
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Ensure resource group exists
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az group create \
+              --name ${{ env.AZURE_RESOURCE_GROUP }} \
+              --location ${{ env.LOCATION }} \
+              --output none
+
+      - name: Validate Bicep template
+        uses: azure/arm-deploy@v2
+        with:
+          scope: resourcegroup
+          subscriptionId: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          resourceGroupName: ${{ env.AZURE_RESOURCE_GROUP }}
+          template: ./infra/main.bicep
+          parameters: >
+            vmName=${{ env.VM_NAME }}
+            adminUsername=${{ secrets.VM_ADMIN_USERNAME }}
+            adminPassword=${{ secrets.VM_ADMIN_PASSWORD }}
+          deploymentMode: Validate
+          deploymentName: validate-${{ github.run_number }}
+
+  # ─────────────────────────────────────────────
+  # JOB 2 – Deploy the VM
+  # ─────────────────────────────────────────────
+  deploy:
+    name: Deploy Azure VM
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    outputs:
+      vm_public_ip: ${{ steps.get_ip.outputs.vm_public_ip }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create / confirm resource group
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az group create \
+              --name ${{ env.AZURE_RESOURCE_GROUP }} \
+              --location ${{ env.LOCATION }} \
+              --output none
+
+      - name: Deploy VM via Bicep
+        id: arm_deploy
+        uses: azure/arm-deploy@v2
+        with:
+          scope: resourcegroup
+          subscriptionId: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          resourceGroupName: ${{ env.AZURE_RESOURCE_GROUP }}
+          template: ./infra/main.bicep
+          parameters: >
+            vmName=${{ env.VM_NAME }}
+            adminUsername=${{ secrets.VM_ADMIN_USERNAME }}
+            adminPassword=${{ secrets.VM_ADMIN_PASSWORD }}
+          deploymentName: deploy-vm-${{ github.run_number }}
+
+      - name: Get VM public IP
+        id: get_ip
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            PUBLIC_IP=$(az vm show \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --name ${{ env.VM_NAME }} \
+              --show-details \
+              --query publicIps \
+              --output tsv)
+            echo "VM Public IP: $PUBLIC_IP"
+            echo "vm_public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+
+      - name: Write deployment summary
+        run: |
+          echo "## Azure VM Deployment Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| VM Name | ${{ env.VM_NAME }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Resource Group | ${{ env.AZURE_RESOURCE_GROUP }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Location | ${{ env.LOCATION }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Public IP | ${{ steps.get_ip.outputs.vm_public_ip }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Run Number | ${{ github.run_number }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered By | ${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────
+  # JOB 3 – Teardown (manual only, dev env)
+  # ─────────────────────────────────────────────
+  teardown:
+    name: Teardown Resources
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.environment == 'dev'
+    environment: teardown
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Delete resource group
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az group delete \
+              --name ${{ env.AZURE_RESOURCE_GROUP }} \
+              --yes \
+              --no-wait
+            echo "Resource group deletion initiated."
